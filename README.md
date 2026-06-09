@@ -6,9 +6,9 @@ The demo shows how a client authenticates to the authorization server using a TL
 
 ## How it works
 
-### Token request with mTLS
+### Token request - mTLS then client_credentials
 
-The client presents its X.509 certificate during the TLS handshake. Keycloak verifies the certificate's SubjectDN against the registered client, then issues an access token containing a SHA-256 thumbprint of the client certificate.
+Two things happen in sequence: first the mTLS handshake (where the client proves private key ownership), then the OAuth `client_credentials` grant runs over that connection.
 
 ```mermaid
 sequenceDiagram
@@ -16,27 +16,48 @@ sequenceDiagram
     participant I as Ingress (nginx)
     participant KC as Keycloak
 
+    rect rgb(235, 245, 255)
+    Note over C,I: Step 1: mTLS handshake
     C->>I: TLS ClientHello + client certificate
-    I->>I: Verify client cert against CA
+    C->>I: CertificateVerify (signed with private key)
+    I->>I: Verify signature + check cert against CA
+    Note over C,I: mTLS established
+    end
+
+    rect rgb(255, 243, 224)
+    Note over C,KC: Step 2: client_credentials grant over mTLS
+    C->>I: POST /token (client_id=mtls-demo, grant_type=client_credentials)
     I->>KC: Forward request + ssl-client-cert header
     KC->>KC: Extract cert from header (nginx SPI)
-    KC->>KC: Match SubjectDN to registered client
+    KC->>KC: Client authenticator = X509 -> match SubjectDN
     KC->>KC: Compute x5t#S256 = base64url(SHA-256(DER(cert)))
     KC->>KC: Embed cnf.x5t#S256 in access token
     KC-->>I: 200 OK + access_token (with cnf claim)
     I-->>C: 200 OK + access_token
+    end
 ```
+
+The ingress is configured with `auth-tls-verify-client: optional` - it requests a client cert but does not require one. Clients without certs (e.g. `spa-token-demo`) connect normally on the same ingress. Keycloak decides per-client whether a certificate is required.
 
 ### Token verification at resource server
 
-When the client uses the token at a resource server, the RS extracts the thumbprint from the JWT and compares it with the certificate presented in the current TLS connection. A stolen token is useless without the matching private key.
+When the client uses the token at a resource server, the same two-step process happens: mTLS handshake first (client proves private key ownership again), then the HTTP request. The RS extracts the thumbprint from the JWT and compares it with the certificate from the current TLS session.
 
 ```mermaid
 sequenceDiagram
     participant C as Client
     participant RS as Resource Server
 
-    C->>RS: mTLS + Authorization: Bearer <token>
+    rect rgb(235, 245, 255)
+    Note over C,RS: Step 1: mTLS handshake
+    C->>RS: TLS ClientHello + client certificate
+    C->>RS: CertificateVerify (signed with private key)
+    RS->>RS: Verify signature -> mTLS established
+    end
+
+    rect rgb(220, 252, 231)
+    Note over C,RS: Step 2: API request over mTLS
+    C->>RS: Authorization: Bearer <token>
     RS->>RS: Validate JWT signature, expiry, issuer
     RS->>RS: Extract cnf.x5t#S256 from token
     RS->>RS: Compute SHA-256 of presented client cert
@@ -45,9 +66,12 @@ sequenceDiagram
     else Thumbprints differ or no cert
         RS-->>C: 401 Unauthorized
     end
+    end
 ```
 
 ### What happens when a token is stolen
+
+The attacker has the JWT but not the client's private key. Without the private key, they cannot complete the CertificateVerify step of the mTLS handshake.
 
 ```mermaid
 sequenceDiagram
@@ -56,15 +80,20 @@ sequenceDiagram
 
     Note over A: Has stolen JWT but not the client's private key
 
+    rect rgb(255, 235, 235)
+    Note over A,RS: Attempt 1: no client certificate
     A->>RS: TLS (no client cert) + Authorization: Bearer <stolen_token>
-    RS->>RS: JWT is valid, but cnf claim present
-    RS->>RS: No client cert in TLS connection
+    RS->>RS: JWT valid, cnf claim present, but no client cert
     RS-->>A: 401 Unauthorized
+    end
 
-    Note over A: Tries with own certificate
-    A->>RS: mTLS (attacker cert) + Authorization: Bearer <stolen_token>
-    RS->>RS: SHA-256(attacker_cert) != cnf.x5t#S256
+    rect rgb(255, 235, 235)
+    Note over A,RS: Attempt 2: attacker's own certificate
+    A->>RS: TLS + attacker's cert + CertificateVerify (attacker's key)
+    A->>RS: Authorization: Bearer <stolen_token>
+    RS->>RS: SHA-256(attacker_cert) != cnf.x5t#S256 in token
     RS-->>A: 401 Unauthorized
+    end
 ```
 
 ## Reproducing from scratch
