@@ -224,11 +224,65 @@ openssl x509 -req -in certs/wrong.csr \
 
 ### Keycloak client: `mtls-demo`
 
-- Client authenticator: **X509 Certificate**
+- Client authenticator: **X509 Certificate** (`clientAuthenticatorType: "client-x509"`)
 - SubjectDN: `O=KSE Lab,CN=mtls-demo-client` (RFC 2253 format - reversed from OpenSSL default)
 - Service accounts enabled: yes
 - Grant type: `client_credentials`
-- OAuth 2.0 Mutual TLS Certificate Bound Access Tokens: **enabled**
+- OAuth 2.0 Mutual TLS Certificate Bound Access Tokens: **enabled** (`tls.client.certificate.bound.access.tokens: "true"`)
+
+These are two independent features:
+
+1. **X509 client authenticator** - replaces `client_secret`. Keycloak extracts the SubjectDN from the certificate and matches it against the configured value. Any cert with a matching SubjectDN signed by a trusted CA will authenticate.
+2. **Certificate-bound tokens** - Keycloak computes `SHA-256(DER(cert))`, base64url-encodes it, and embeds it as `cnf.x5t#S256` in the signed JWT. The JWT signature (Keycloak's private key) makes the binding tamper-proof.
+
+## Security: proxy header trust model
+
+Keycloak reads the client certificate from the `ssl-client-cert` HTTP header set by the ingress proxy. It does not terminate mTLS itself. This raises a question: what stops an attacker from forging this header?
+
+### Defenses (layered)
+
+**1. Certificate chain revalidation (Keycloak)**
+
+By default, `trust-proxy-verification` = `false` for the nginx SPI provider. Keycloak does NOT blindly trust the proxy - it rebuilds the certificate chain using its own truststore and validates the certificate independently. A self-signed or untrusted-CA certificate is rejected even if the SubjectDN matches.
+
+**2. `proxy-trusted-addresses` (Keycloak)**
+
+Keycloak can restrict which source IPs are allowed to set proxy headers:
+
+```
+--proxy-trusted-addresses=10.0.0.0/8
+```
+
+Headers from other IPs are ignored.
+
+**3. Network isolation (Kubernetes)**
+
+Keycloak runs as a ClusterIP service - not directly reachable from outside the cluster. A NetworkPolicy can further restrict access to only the ingress-nginx pods:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: keycloak-allow-nginx-only
+spec:
+  podSelector:
+    matchLabels:
+      app: keycloak
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: ingress-nginx
+```
+
+**4. Gateway CA verification (resource server)**
+
+Even if all previous layers are bypassed and a forged token is obtained, the API gateway performs real mTLS with the client. The gateway verifies the client certificate against its trusted CA. A self-generated certificate not signed by the trusted CA fails the TLS handshake - the forged token is useless.
+
+### References
+
+- [Keycloak - Reverse Proxy Security](https://www.keycloak.org/server/reverseproxy)
+- [X.509 Header Spoofing Research](https://psytester.github.io/Keycloak_behind_reverse_proxy_spoof_X509_login_flow/)
 
 ## Repository contents
 
