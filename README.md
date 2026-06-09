@@ -39,60 +39,65 @@ sequenceDiagram
 
 The ingress is configured with `auth-tls-verify-client: optional` - it requests a client cert but does not require one. Clients without certs (e.g. `spa-token-demo`) connect normally on the same ingress. Keycloak decides per-client whether a certificate is required.
 
-### Token verification at resource server
+### Token verification at resource server (gateway pattern)
 
-When the client uses the token at a resource server, the same two-step process happens: mTLS handshake first (client proves private key ownership again), then the HTTP request. The RS extracts the thumbprint from the JWT and compares it with the certificate from the current TLS session.
+In practice, the resource server sits behind a gateway (like ingress-nginx). The client does mTLS with the gateway, and the gateway forwards the certificate thumbprint to the backend as a trusted header. The backend compares this header with the `cnf.x5t#S256` claim in the JWT.
 
 ```mermaid
 sequenceDiagram
     participant C as Client
+    participant GW as API Gateway
     participant RS as Resource Server
 
     rect rgb(235, 245, 255)
-    Note over C,RS: Step 1: mTLS handshake
-    C->>RS: TLS ClientHello + client certificate
-    C->>RS: CertificateVerify (signed with private key)
-    RS->>RS: Verify signature -> mTLS established
+    Note over C,GW: Step 1: mTLS handshake with gateway
+    C->>GW: TLS ClientHello + client certificate
+    C->>GW: CertificateVerify (signed with private key)
+    GW->>GW: Verify signature -> mTLS established
     end
 
     rect rgb(220, 252, 231)
-    Note over C,RS: Step 2: API request over mTLS
-    C->>RS: Authorization: Bearer <token>
+    Note over C,RS: Step 2: API request
+    C->>GW: Authorization: Bearer <token>
+    GW->>GW: Extract client cert, compute SHA-256 thumbprint
+    GW->>RS: Authorization: Bearer <token> + X-Client-Cert-Hash header
     RS->>RS: Validate JWT signature, expiry, issuer
-    RS->>RS: Extract cnf.x5t#S256 from token
-    RS->>RS: Compute SHA-256 of presented client cert
+    RS->>RS: Extract cnf.x5t#S256 from JWT
+    RS->>RS: Compare cnf.x5t#S256 with X-Client-Cert-Hash header
     alt Thumbprints match
-        RS-->>C: 200 OK (authorized)
-    else Thumbprints differ or no cert
+        RS-->>C: 200 OK
+    else Mismatch or header missing
         RS-->>C: 401 Unauthorized
     end
     end
 ```
 
+The backend never sees the TLS connection directly - it trusts the thumbprint header from the gateway. The gateway must strip any client-provided `X-Client-Cert-Hash` before setting its own.
+
 ### What happens when a token is stolen
 
-The attacker has the JWT but not the client's private key. Without the private key, they cannot complete the CertificateVerify step of the mTLS handshake.
+The attacker has the JWT but not the client's private key. Without the private key, they cannot complete the CertificateVerify step of the mTLS handshake with the gateway.
 
 ```mermaid
 sequenceDiagram
     participant A as Attacker
-    participant RS as Resource Server
+    participant GW as API Gateway
 
     Note over A: Has stolen JWT but not the client's private key
 
     rect rgb(255, 235, 235)
-    Note over A,RS: Attempt 1: no client certificate
-    A->>RS: TLS (no client cert) + Authorization: Bearer <stolen_token>
-    RS->>RS: JWT valid, cnf claim present, but no client cert
-    RS-->>A: 401 Unauthorized
+    Note over A,GW: Attempt 1: no client certificate
+    A->>GW: TLS (no client cert) + Authorization: Bearer <stolen_token>
+    GW->>GW: No client cert -> no thumbprint header
+    Note over GW: Backend sees cnf claim in JWT but no thumbprint header -> 401
     end
 
     rect rgb(255, 235, 235)
-    Note over A,RS: Attempt 2: attacker's own certificate
-    A->>RS: TLS + attacker's cert + CertificateVerify (attacker's key)
-    A->>RS: Authorization: Bearer <stolen_token>
-    RS->>RS: SHA-256(attacker_cert) != cnf.x5t#S256 in token
-    RS-->>A: 401 Unauthorized
+    Note over A,GW: Attempt 2: attacker's own certificate
+    A->>GW: TLS + attacker's cert + CertificateVerify (attacker's key)
+    A->>GW: Authorization: Bearer <stolen_token>
+    GW->>GW: Compute SHA-256(attacker_cert) -> forward as header
+    Note over GW: Backend: SHA-256(attacker_cert) != cnf.x5t#S256 in JWT -> 401
     end
 ```
 
