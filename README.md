@@ -67,9 +67,118 @@ sequenceDiagram
     RS-->>A: 401 Unauthorized
 ```
 
-## Lab infrastructure
+## Reproducing from scratch
 
-The lab Keycloak at `keycloak.192.168.50.10.nip.io` is configured for mTLS via [kse-labs-deployment PR #3](https://github.com/kse-bd8338bbe006/kse-labs-deployment/pull/3):
+This section walks through every step needed to set up the demo on a fresh lab cluster.
+
+### 1. Generate the client CA
+
+The CA must have explicit `basicConstraints` and `keyUsage` extensions - without them, ingress-nginx rejects the certificate with "x509: malformed extension value field".
+
+```bash
+openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
+  -keyout certs/client-ca.key \
+  -out certs/client-ca.crt \
+  -subj "/O=KSE Lab/CN=Client Certificate CA" \
+  -addext "basicConstraints=critical,CA:TRUE" \
+  -addext "keyUsage=critical,keyCertSign,cRLSign"
+```
+
+### 2. Create the Kubernetes secret for the CA
+
+ingress-nginx needs the CA cert to verify client certificates:
+
+```bash
+kubectl create secret generic client-ca \
+  --from-file=ca.crt=certs/client-ca.crt \
+  -n keycloak
+```
+
+### 3. Configure ingress-nginx and Keycloak
+
+Add annotations to the Keycloak Ingress:
+
+```yaml
+# ingress.yaml
+annotations:
+  nginx.ingress.kubernetes.io/auth-tls-verify-client: "optional"
+  nginx.ingress.kubernetes.io/auth-tls-secret: "keycloak/client-ca"
+  nginx.ingress.kubernetes.io/auth-tls-pass-certificate-to-upstream: "true"
+```
+
+Add startup args to the Keycloak Deployment so it reads the client cert from the proxy header (TLS terminates at ingress, not at Keycloak):
+
+```yaml
+# deployment.yaml args (add to existing args list)
+- --spi-x509cert-lookup-provider=nginx
+- --spi-x509cert-lookup-nginx-ssl-client-cert=ssl-client-cert
+```
+
+The full diff is in [kse-labs-deployment PR #3](https://github.com/kse-bd8338bbe006/kse-labs-deployment/pull/3).
+
+### 4. Create the Keycloak client
+
+Get an admin token and create the `mtls-demo` client via the Admin REST API:
+
+```bash
+KC_URL="https://keycloak.192.168.50.10.nip.io"
+
+TOKEN=$(curl -sk "$KC_URL/realms/master/protocol/openid-connect/token" \
+  -d "grant_type=password" \
+  -d "client_id=admin-cli" \
+  -d "username=admin" \
+  -d "password=admin" | jq -r .access_token)
+
+curl -sk -X POST "$KC_URL/admin/realms/api-security/clients" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "clientId": "mtls-demo",
+    "name": "mTLS Certificate-Bound Token Demo",
+    "enabled": true,
+    "publicClient": false,
+    "clientAuthenticatorType": "client-x509",
+    "standardFlowEnabled": false,
+    "directAccessGrantsEnabled": true,
+    "serviceAccountsEnabled": true,
+    "protocol": "openid-connect",
+    "attributes": {
+      "x509.subjectdn": "O=KSE Lab,CN=mtls-demo-client",
+      "x509.allow.regex.pattern.comparison": "false",
+      "tls.client.certificate.bound.access.tokens": "true"
+    }
+  }'
+```
+
+The SubjectDN must be in RFC 2253 format (Java's default) - the order is reversed compared to OpenSSL's default output. OpenSSL shows `CN=mtls-demo-client, O=KSE Lab` but Keycloak expects `O=KSE Lab,CN=mtls-demo-client`. Use `openssl x509 -subject -nameopt RFC2253` to get the correct format.
+
+### 5. Generate client certificates
+
+Valid client certificate (SubjectDN matches the Keycloak client):
+
+```bash
+openssl req -newkey rsa:2048 -nodes \
+  -keyout certs/client.key -out certs/client.csr \
+  -subj "/O=KSE Lab/CN=mtls-demo-client"
+
+openssl x509 -req -in certs/client.csr \
+  -CA certs/client-ca.crt -CAkey certs/client-ca.key \
+  -CAcreateserial -out certs/client.crt -days 365
+```
+
+Wrong certificate for negative testing (different CN, same CA):
+
+```bash
+openssl req -newkey rsa:2048 -nodes \
+  -keyout certs/wrong.key -out certs/wrong.csr \
+  -subj "/O=KSE Lab/CN=wrong-client"
+
+openssl x509 -req -in certs/wrong.csr \
+  -CA certs/client-ca.crt -CAkey certs/client-ca.key \
+  -CAcreateserial -out certs/wrong.crt -days 365
+```
+
+## Lab infrastructure summary
 
 | Component | Configuration | Purpose |
 |---|---|---|
